@@ -102,10 +102,15 @@ def kda_gate_fwd_kernel(
     HAS_BIAS: tl.constexpr,
     HAS_BETA: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    PER_CHANNEL: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
 
-    b_A = tl.load(A_log + i_h).to(tl.float32)
+    if PER_CHANNEL:
+        o_a = i_h * D + tl.arange(0, BD)
+        b_A = tl.load(A_log + o_a, mask=o_a < H * D, other=0.0).to(tl.float32)[None, :]
+    else:
+        b_A = tl.load(A_log + i_h).to(tl.float32)
 
     o_t = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BD)
@@ -165,10 +170,15 @@ def kda_gate_bwd_kernel(
     HAS_BIAS: tl.constexpr,
     HAS_BETA: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    PER_CHANNEL: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
 
-    b_A = tl.load(A_log + i_h).to(tl.float32)
+    if PER_CHANNEL:
+        o_a = i_h * D + tl.arange(0, BD)
+        b_A = tl.load(A_log + o_a, mask=o_a < H * D, other=0.0).to(tl.float32)[None, :]
+    else:
+        b_A = tl.load(A_log + i_h).to(tl.float32)
 
     o_t = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BD)
@@ -191,7 +201,7 @@ def kda_gate_bwd_kernel(
         b_A = -exp(b_A)
         b_yg = b_A * softplus(b_g)
         b_dg = b_A * (b_dyg * tl.sigmoid(b_g))
-        b_dA = tl.sum(tl.sum(b_dyg * b_yg, 1), 0)
+        b_dA = tl.sum(b_dyg * b_yg, 0) if PER_CHANNEL else tl.sum(tl.sum(b_dyg * b_yg, 1), 0)
     else:
         b_A = exp(b_A)
         b_inner = b_A * b_g
@@ -201,10 +211,14 @@ def kda_gate_bwd_kernel(
         b_d_inner_term = b_dyg * (lower_bound * b_dsig)
         # dg = d_inner_term * A
         b_dg = b_d_inner_term * b_A
-        b_dA = tl.sum(tl.sum(b_dg * b_g, 1), 0)
+        b_dA = tl.sum(b_dg * b_g, 0) if PER_CHANNEL else tl.sum(tl.sum(b_dg * b_g, 1), 0)
 
     tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), mask=m_g)
-    tl.store(dA + i_t * H + i_h, b_dA)
+    if PER_CHANNEL:
+        o_a2 = i_h * D + tl.arange(0, BD)
+        tl.store(dA + i_t * (H * D) + o_a2, b_dA, mask=o_a2 < H * D)
+    else:
+        tl.store(dA + i_t * H + i_h, b_dA)
 
     if HAS_BETA:
         p_b = beta + i_h + o_t * H
@@ -228,6 +242,7 @@ def kda_gate_fwd(
     T = g.numel() // (H * K)
 
     yg = torch.empty_like(g, dtype=output_dtype)
+    per_channel = A_log.numel() == H * K
 
     def grid(meta):
         return (triton.cdiv(T, meta["BT"]), H)
@@ -244,6 +259,7 @@ def kda_gate_fwd(
         D=K,
         BD=triton.next_power_of_2(K),
         lower_bound=lower_bound,
+        PER_CHANNEL=per_channel,
     )
     return yg
 
@@ -262,7 +278,8 @@ def kda_gate_bwd(
     NT = triton.cdiv(T, BT)
 
     dg = torch.empty_like(g, dtype=torch.float32)
-    dA = A_log.new_empty(NT, H, dtype=torch.float32)
+    per_channel = A_log.numel() == H * K
+    dA = A_log.new_empty(NT, H * K if per_channel else H, dtype=torch.float32)
 
     grid = (triton.cdiv(T, BT), H)
     kda_gate_bwd_kernel[grid](
@@ -281,6 +298,7 @@ def kda_gate_bwd(
         BT=BT,
         BD=triton.next_power_of_2(K),
         lower_bound=lower_bound,
+        PER_CHANNEL=per_channel,
     )
 
     dg = dg.view_as(g).type_as(g)
@@ -391,6 +409,7 @@ def kda_gate_chunk_cumsum_vector_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    PER_CHANNEL: tl.constexpr,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -414,7 +433,10 @@ def kda_gate_chunk_cumsum_vector_kernel(
         b_bias = tl.load(dt_bias + i_h * S + o_s, mask=o_s < S, other=0.0).to(tl.float32)
         b_s = b_s + b_bias[None, :]
 
-    b_A = tl.load(A_log + i_h).to(tl.float32)
+    if PER_CHANNEL:
+        b_A = tl.load(A_log + i_h * S + o_s, mask=o_s < S, other=0.0).to(tl.float32)[None, :]
+    else:
+        b_A = tl.load(A_log + i_h).to(tl.float32)
     if not USE_LOWER_BOUND:
         # Apply gate: -exp(A_log) * softplus(g + bias)
         b_gate = -exp(b_A) * softplus(b_s)
@@ -472,5 +494,6 @@ def kda_gate_chunk_cumsum(
         S=S,
         BT=BT,
         REVERSE=False,
+        PER_CHANNEL=A_log.numel() == H * S,
     )
     return g
